@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: Optional website URL (not used by Flutter ZIP build)
+        description: Website URL to wrap in an Android WebView (used when ZIP is not supplied)
         required: false
         type: string
       app_name:
@@ -19,8 +19,8 @@ on:
         required: false
         type: string
       zip_url:
-        description: Temporary URL to ZIP containing a Flutter project
-        required: true
+        description: Temporary URL to ZIP containing a Flutter project (optional when URL is supplied)
+        required: false
         type: string
       build_type:
         description: APK variant
@@ -40,15 +40,15 @@ jobs:
         with:
           channel: stable
           cache: true
-      - name: Download and validate Flutter ZIP
+      - name: Prepare Flutter project
         env:
           ZIP_URL: ${{ inputs.zip_url }}
+          WEBSITE_URL: ${{ inputs.url }}
         run: |
           set -euo pipefail
-          test -n "$ZIP_URL"
-          curl --fail --location --silent --show-error --max-time 180 "$ZIP_URL" -o project.zip
-          # Reject path traversal and symlinks before extracting an untrusted archive.
-          python3 - <<'PYZIP'
+          if [ -n "$ZIP_URL" ]; then
+            curl --fail --location --silent --show-error --max-time 180 "$ZIP_URL" -o project.zip
+            python3 - <<'PYZIP'
           import pathlib, stat, zipfile
           archive = zipfile.ZipFile('project.zip')
           for item in archive.infolist():
@@ -57,19 +57,64 @@ jobs:
               if name.is_absolute() or '..' in name.parts or (mode and stat.S_ISLNK(mode)):
                   raise SystemExit(f'Path/symlink tidak aman di ZIP: {item.filename}')
           PYZIP
-          mkdir project
-          unzip -q project.zip -d project
-          if [ ! -f project/pubspec.yaml ]; then
-            mapfile -t manifests < <(find project -mindepth 2 -maxdepth 5 -name pubspec.yaml -type f -print)
-            if [ "${#manifests[@]}" -ne 1 ]; then echo "ZIP harus berisi tepat satu project Flutter dengan pubspec.yaml"; exit 1; fi
-            root_dir="$(dirname "${manifests[0]}")"
-            shopt -s dotglob
-            mkdir -p project-root
-            cp -a "$root_dir"/. project-root/
-            rm -rf project
-            mv project-root project
+            mkdir project
+            unzip -q project.zip -d project
+            if [ ! -f project/pubspec.yaml ]; then
+              mapfile -t manifests < <(find project -mindepth 2 -maxdepth 5 -name pubspec.yaml -type f -print)
+              if [ "${#manifests[@]}" -ne 1 ]; then echo "ZIP harus berisi tepat satu project Flutter dengan pubspec.yaml"; exit 1; fi
+              root_dir="$(dirname "${manifests[0]}")"
+              shopt -s dotglob
+              mkdir -p project-root
+              cp -a "$root_dir"/. project-root/
+              rm -rf project
+              mv project-root project
+            fi
+            test -f project/pubspec.yaml
+          else
+            python3 - <<'PYURL'
+          import os, urllib.parse
+          u = os.environ.get('WEBSITE_URL', '').strip()
+          p = urllib.parse.urlparse(u)
+          if p.scheme not in ('http', 'https') or not p.netloc:
+              raise SystemExit('Isi URL website http:// atau https://, atau upload ZIP project Flutter.')
+          PYURL
+            flutter create --project-name web2apk_generated project
+            cd project
+            flutter pub add webview_flutter
+            python3 - <<'PYAPP'
+          import os
+          from pathlib import Path
+          url = os.environ['WEBSITE_URL'].strip().replace('\\', '\\\\').replace("'", "\\'")
+          Path('lib/main.dart').write_text("""import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          void main() => runApp(const Web2ApkApp());
+          class Web2ApkApp extends StatelessWidget {
+            const Web2ApkApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+              home: const WebsitePage(),
+            );
+          }
+          class WebsitePage extends StatefulWidget {
+            const WebsitePage({super.key});
+            @override
+            State<WebsitePage> createState() => _WebsitePageState();
+          }
+          class _WebsitePageState extends State<WebsitePage> {
+            late final WebViewController controller = WebViewController()
+              ..setJavaScriptMode(JavaScriptMode.unrestricted)
+              ..loadRequest(Uri.parse('""" + url + """'));
+            @override
+            Widget build(BuildContext context) => Scaffold(
+              body: SafeArea(child: WebViewWidget(controller: controller)),
+            );
+          }
+          """)
+          PYAPP
+            cd ..
           fi
-          test -f project/pubspec.yaml
       - name: Install Flutter dependencies
         working-directory: project
         run: flutter pub get
@@ -79,23 +124,23 @@ jobs:
           PACKAGE_NAME: ${{ inputs.package_name }}
         run: |
           python3 - <<'PY'
-          import os, pathlib, re
+          import os, pathlib, re, xml.sax.saxutils
           root = pathlib.Path('project/android/app')
-          app = os.environ['APP_NAME'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          app = xml.sax.saxutils.escape(os.environ['APP_NAME'], {'"': '&quot;'})
           package = os.environ['PACKAGE_NAME']
           manifest = root / 'src/main/AndroidManifest.xml'
           if manifest.exists():
               s = manifest.read_text()
-              s = re.sub(r'android:label="[^"]*"', 'android:label="' + app + '"', s, count=1)
+              if re.search(r'android:label="[^"]*"', s):
+                  s = re.sub(r'android:label="[^"]*"', 'android:label="' + app + '"', s, count=1)
               manifest.write_text(s)
-          gradle_files = [root/'build.gradle', root/'build.gradle.kts']
-          for f in gradle_files:
+          for f in [root/'build.gradle', root/'build.gradle.kts']:
               if not f.exists(): continue
               s = f.read_text()
               if f.name.endswith('.kts'):
                   s = re.sub(r'applicationId\s*=\s*"[^"]+"', 'applicationId = "' + package + '"', s, count=1)
               else:
-                  s = re.sub(r'applicationId\s+["'][^"']+["']', 'applicationId "' + package + '"', s, count=1)
+                  s = re.sub(r'applicationId\s+["\'][^"\']+["\']', 'applicationId "' + package + '"', s, count=1)
               f.write_text(s)
           PY
       - name: Build APK
